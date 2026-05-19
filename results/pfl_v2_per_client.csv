@@ -1,0 +1,6 @@
+Client,Local_Only_central,StdFL_client_test,pFL_LFT,pFL_CLF_Only,pFL_FedProx
+Coronavirus,0.5659,0.7198,0.7999,0.7932,0.8017
+Parasite,0.7249,0.7838,0.8907,0.8645,0.8901
+Human,0.6641,0.6615,0.7438,0.7292,0.7417
+Flavivirus,0.5664,0.5591,0.7,0.6964,0.6954
+Bacteria,0.6476,0.6118,0.7085,0.718,0.7048

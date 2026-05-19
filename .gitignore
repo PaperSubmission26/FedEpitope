@@ -1,0 +1,31 @@
+# Python/cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Logs
+*.log
+wget-log
+wget-log.*
+
+# Huge raw dataset
+bcell_full_v3.csv
+
+# Large model/experiment artifacts
+checkpoints/
+outputs/
+runs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.pkl
+*.npy
+*.npz
+
+# Private/environment/editor files
+.env
+.vscode/
+.idea/
+.DS_Store
