@@ -1,0 +1,8 @@
+matplotlib==3.10.9
+numpy==2.4.6
+opacus==1.5.4
+pandas==3.0.3
+peft==0.18.1
+scikit_learn==1.8.0
+torch==2.5.1+cu121
+transformers==5.5.0
