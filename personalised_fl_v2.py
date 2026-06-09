@@ -1,55 +1,124 @@
-import torch
+import os
 import copy
-import pandas as pd
+import random
+import argparse
+import warnings
+import time
+import math
+import traceback
+from datetime import timedelta
+
 import numpy as np
+import pandas as pd
+import torch
+
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, EsmForSequenceClassification
 from peft import get_peft_model, LoraConfig, TaskType
-from sklearn.metrics import (roc_auc_score, average_precision_score,
-                              f1_score, matthews_corrcoef)
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import warnings
-import os
-warnings.filterwarnings('ignore')
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    f1_score,
+    matthews_corrcoef,
+)
 
-# ── Config ─────────────────────────────────────────────────────────────────
-NUM_ROUNDS   = 20
-LOCAL_EPOCHS = 3
+warnings.filterwarnings("ignore")
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
 NUM_CLIENTS  = 5
 BATCH_SIZE   = 64
 LR           = 2e-4
 MAX_LEN      = 30
 
-PERSONAL_EPOCHS_V1 = 10
-PERSONAL_LR_V1     = 1e-5
+PERSONAL_EPOCHS = 10
+PERSONAL_LR_LFT = 1e-5   # pFL-LFT  : LoRA + head
+PERSONAL_LR_CLF = 1e-4   # pFL-CLF  : head only
+PERSONAL_LR_FPX = 1e-5   # pFL-FedProx
+MU              = 0.01
 
-PERSONAL_EPOCHS_V2 = 10
-PERSONAL_LR_V2     = 1e-4
+CLIENT_TRAIN_FILES = [f"data/client{i + 1}_train.csv" for i in range(NUM_CLIENTS)]
+CLIENT_VAL_FILES   = [f"data/client{i + 1}_val.csv"   for i in range(NUM_CLIENTS)]
+CLIENT_TEST_FILES  = [f"data/client{i + 1}_test.csv"  for i in range(NUM_CLIENTS)]
 
-PERSONAL_EPOCHS_V3 = 10
-PERSONAL_LR_V3     = 1e-5
-MU                 = 0.01
+CLIENT_NAMES = [
+    "Coronavirus",
+    "Parasite",
+    "Human/Self",
+    "Flavivirus",
+    "Bacteria",
+]
 
-CLASSIFIER_PARAM_NAMES = {
-    'base_model.model.classifier.modules_to_save.default.dense.weight',
-    'base_model.model.classifier.modules_to_save.default.dense.bias',
-    'base_model.model.classifier.modules_to_save.default.out_proj.weight',
-    'base_model.model.classifier.modules_to_save.default.out_proj.bias',
-}
 
-CLIENT_TRAIN_FILES  = [f'data/client{i+1}_train.csv' for i in range(NUM_CLIENTS)]
-CLIENT_VAL_FILES    = [f'data/client{i+1}_val.csv'   for i in range(NUM_CLIENTS)]
-CLIENT_TEST_FILES   = [f'data/client{i+1}_test.csv'  for i in range(NUM_CLIENTS)]
-CLIENT_NAMES        = ['Coronavirus','Parasite','Human','Flavivirus','Bacteria']
+# ============================================================
+# Utility — identical to federated_train.py
+# ============================================================
 
-# ── Dataset ────────────────────────────────────────────────────────────────
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+
+def seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def format_seconds(seconds):
+    if seconds is None or math.isnan(seconds) or math.isinf(seconds):
+        return "unknown"
+    return str(timedelta(seconds=int(seconds)))
+
+
+def print_gpu_memory():
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated()      / 1024 ** 3
+        reserved  = torch.cuda.memory_reserved()       / 1024 ** 3
+        max_alloc = torch.cuda.max_memory_allocated()  / 1024 ** 3
+        print(
+            f"GPU memory | allocated: {allocated:.2f} GB | "
+            f"reserved: {reserved:.2f} GB | "
+            f"max allocated: {max_alloc:.2f} GB"
+        )
+    else:
+        print("GPU memory | CUDA not available")
+
+
+def check_required_files(fed_checkpoint: str):
+    required = (
+        CLIENT_TRAIN_FILES
+        + CLIENT_VAL_FILES
+        + CLIENT_TEST_FILES
+        + ["data/central_test.csv", fed_checkpoint]
+    )
+    missing = [p for p in required if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(
+            "Missing required files:\n" + "\n".join(missing)
+        )
+
+
+# ============================================================
+# Dataset — identical to federated_train.py
+# ============================================================
+
 class EpitopeDataset(Dataset):
     def __init__(self, csv_path, tokenizer, max_length=MAX_LEN):
         df = pd.read_csv(csv_path)
-        self.sequences  = df['sequence'].tolist()
-        self.labels     = df['label'].tolist()
+        if "sequence" not in df.columns:
+            raise ValueError(f"{csv_path} missing column: sequence")
+        if "label" not in df.columns:
+            raise ValueError(f"{csv_path} missing column: label")
+        self.sequences  = df["sequence"].astype(str).tolist()
+        self.labels     = df["label"].astype(int).tolist()
         self.tokenizer  = tokenizer
         self.max_length = max_length
 
@@ -59,552 +128,701 @@ class EpitopeDataset(Dataset):
     def __getitem__(self, idx):
         enc = self.tokenizer(
             self.sequences[idx],
-            return_tensors='pt',
-            padding='max_length',
+            return_tensors="pt",
+            padding="max_length",
             truncation=True,
-            max_length=self.max_length
+            max_length=self.max_length,
         )
         return {
-            'input_ids':      enc['input_ids'].squeeze(0),
-            'attention_mask': enc['attention_mask'].squeeze(0),
-            'labels':         torch.tensor(self.labels[idx], dtype=torch.long)
+            "input_ids":      enc["input_ids"].squeeze(0),
+            "attention_mask": enc["attention_mask"].squeeze(0),
+            "labels":         torch.tensor(self.labels[idx], dtype=torch.long),
         }
 
-# ── Model ──────────────────────────────────────────────────────────────────
-def build_model():
+
+# ============================================================
+# Model
+# ============================================================
+
+def build_model(lora_rank: int):
     model = EsmForSequenceClassification.from_pretrained(
-        'facebook/esm2_t12_35M_UR50D', num_labels=2)
+        "facebook/esm2_t12_35M_UR50D", num_labels=2
+    )
     lora_config = LoraConfig(
-        task_type=TaskType.SEQ_CLS, r=8, lora_alpha=16,
-        lora_dropout=0.1, target_modules=['query', 'value'])
+        task_type=TaskType.SEQ_CLS,
+        r=lora_rank,
+        lora_alpha=2 * lora_rank,
+        lora_dropout=0.1,
+        target_modules=["query", "value"],
+    )
     return get_peft_model(model, lora_config)
 
-# ── Weight utilities ───────────────────────────────────────────────────────
+
+def get_classifier_param_names(model):
+    """Return the exact set of classifier parameter names for this model."""
+    return {
+        n for n, p in model.named_parameters()
+        if p.requires_grad
+        and any(k in n.lower() for k in ("classifier", "score", "modules_to_save"))
+        and "lora" not in n.lower()
+    }
+
+
+def print_trainable_summary(model, label: str):
+    total      = sum(p.numel() for p in model.parameters())
+    trainable  = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    lora       = sum(
+        p.numel() for n, p in model.named_parameters()
+        if p.requires_grad and "lora" in n.lower()
+    )
+    classifier = sum(
+        p.numel() for n, p in model.named_parameters()
+        if p.requires_grad
+        and any(k in n.lower() for k in ("classifier", "score", "modules_to_save"))
+    )
+    print(
+        f"  [{label}] total={total:,} | trainable={trainable:,} "
+        f"| lora={lora:,} | classifier={classifier:,} "
+        f"| {100 * trainable / total:.4f}%"
+    )
+
+
+# ============================================================
+# Weight utilities
+# ============================================================
+
 def get_trainable_weights(model):
-    return {n: p.data.clone()
-            for n, p in model.named_parameters() if p.requires_grad}
+    return {
+        n: p.detach().cpu().clone()
+        for n, p in model.named_parameters()
+        if p.requires_grad
+    }
+
 
 def set_trainable_weights(model, weights):
     for n, p in model.named_parameters():
         if p.requires_grad and n in weights:
-            p.data.copy_(weights[n])
+            p.data.copy_(weights[n].to(p.device))
     return model
 
-def federated_averaging(client_weights_list, client_sizes):
-    total       = sum(client_sizes)
-    proportions = [s / total for s in client_sizes]
-    averaged    = {}
-    for key in client_weights_list[0].keys():
-        averaged[key] = sum(
-            proportions[i] * client_weights_list[i][key].float()
-            for i in range(len(client_weights_list))
-        )
-    return averaged
 
-# ── Standard local training ────────────────────────────────────────────────
-def train_local_standard(model, loader, optimizer, device,
-                          class_weights, epochs, label):
-    model.train()
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
-    for epoch in range(epochs):
-        total_loss = 0
-        for batch in loader:
-            input_ids      = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels         = batch['labels'].to(device)
-            optimizer.zero_grad()
-            loss = criterion(
-                model(input_ids=input_ids,
-                      attention_mask=attention_mask).logits, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        print(f"  [{label} | Epoch {epoch+1}/{epochs}] "
-              f"Loss: {total_loss/len(loader):.4f}")
+# ============================================================
+# Evaluation — identical to federated_train.py
+# ============================================================
 
-# ── FedProx local training ─────────────────────────────────────────────────
-def train_local_fedprox(model, loader, optimizer, device,
-                         class_weights, epochs, global_weights_cpu,
-                         mu, label):
-    model.train()
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
-    # Move global weights to GPU once before training loop
-    global_weights_gpu = {n: w.to(device)
-                          for n, w in global_weights_cpu.items()}
-    for epoch in range(epochs):
-        total_loss = 0
-        for batch in loader:
-            input_ids      = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels         = batch['labels'].to(device)
-            optimizer.zero_grad()
-            ce_loss = criterion(
-                model(input_ids=input_ids,
-                      attention_mask=attention_mask).logits, labels)
-            prox_loss = 0.0
-            for n, p in model.named_parameters():
-                if p.requires_grad and n in global_weights_gpu:
-                    prox_loss += ((p - global_weights_gpu[n]) ** 2).sum()
-            prox_loss = (mu / 2) * prox_loss
-            loss      = ce_loss + prox_loss
-            loss.backward()
-            optimizer.step()
-            total_loss += ce_loss.item()
-        print(f"  [{label} | Epoch {epoch+1}/{epochs}] "
-              f"CE Loss: {total_loss/len(loader):.4f}")
-
-# ── Evaluation ─────────────────────────────────────────────────────────────
 def evaluate(model, loader, device):
     model.eval()
     all_probs, all_labels = [], []
     with torch.no_grad():
         for batch in loader:
             probs = torch.softmax(
-                model(input_ids=batch['input_ids'].to(device),
-                      attention_mask=batch['attention_mask'].to(device)).logits,
-                dim=1)[:, 1].cpu().numpy()
+                model(
+                    input_ids=batch["input_ids"].to(device),
+                    attention_mask=batch["attention_mask"].to(device),
+                ).logits,
+                dim=1,
+            )[:, 1].cpu().numpy()
             all_probs.extend(probs)
-            all_labels.extend(batch['labels'].numpy())
+            all_labels.extend(batch["labels"].numpy())
     all_probs  = np.array(all_probs)
     all_labels = np.array(all_labels)
     preds      = (all_probs >= 0.5).astype(int)
+    if len(np.unique(all_labels)) < 2:
+        return dict(auc_roc=np.nan, auc_pr=np.nan, f1=np.nan, mcc=np.nan)
     return {
-        'auc_roc': roc_auc_score(all_labels, all_probs),
-        'auc_pr':  average_precision_score(all_labels, all_probs),
-        'f1':      f1_score(all_labels, preds, zero_division=0),
-        'mcc':     matthews_corrcoef(all_labels, preds)
+        "auc_roc": roc_auc_score(all_labels, all_probs),
+        "auc_pr":  average_precision_score(all_labels, all_probs),
+        "f1":      f1_score(all_labels, preds, zero_division=0),
+        "mcc":     matthews_corrcoef(all_labels, preds),
     }
 
-# ── Phase 1: Standard federated training ──────────────────────────────────
-def run_standard_federated(train_loaders, val_loaders,
-                            central_test_loader, client_test_loaders,
-                            device, class_weights_list, client_sizes):
-    print(f"\n{'='*70}")
-    print("PHASE 1: Standard Federated Training")
-    print("  Global model evaluated on central test set each round")
-    print(f"{'='*70}")
 
-    global_model = build_model().to(device)
-    round_aucs   = []
-    best_auc     = 0.0
-    best_weights = None
+# ============================================================
+# Standard local training (used in pFL-LFT and pFL-FedProx)
+# ============================================================
 
-    for round_num in range(1, NUM_ROUNDS + 1):
-        client_weights = []
-        for client_id in range(NUM_CLIENTS):
-            local_model = copy.deepcopy(global_model)
-            optimizer   = torch.optim.AdamW(local_model.parameters(), lr=LR)
-            train_local_standard(
-                local_model, train_loaders[client_id], optimizer,
-                device, class_weights_list[client_id], LOCAL_EPOCHS,
-                f"Round {round_num:02d} | "
-                f"Client {client_id+1} {CLIENT_NAMES[client_id]}")
-            m = evaluate(local_model, val_loaders[client_id], device)
-            print(f"  [Round {round_num:02d} | Client {client_id+1} "
-                  f"{CLIENT_NAMES[client_id]:<12} | Local val] "
-                  f"AUC-ROC: {m['auc_roc']:.4f}")
-            client_weights.append(get_trainable_weights(local_model))
-            del local_model
-            torch.cuda.empty_cache()
-
-        averaged     = federated_averaging(client_weights, client_sizes)
-        global_model = set_trainable_weights(global_model, averaged)
-
-        # Evaluate on central test set
-        metrics = evaluate(global_model, central_test_loader, device)
-        round_aucs.append(metrics['auc_roc'])
-        if metrics['auc_roc'] > best_auc:
-            best_auc     = metrics['auc_roc']
-            best_weights = get_trainable_weights(global_model)
-        print(f"\n  ★ [Standard FL | Round {round_num:02d}] "
-              f"Central test AUC: {metrics['auc_roc']:.4f} | "
-              f"F1: {metrics['f1']:.4f}")
-
-    # Restore best global model
-    global_model = set_trainable_weights(global_model, best_weights)
-
-    # Evaluate global model on each client test set
-    print(f"\n  Global model per-client test AUC (before personalisation):")
-    global_per_client_aucs = []
-    for client_id in range(NUM_CLIENTS):
-        m = evaluate(global_model, client_test_loaders[client_id], device)
-        global_per_client_aucs.append(m['auc_roc'])
-        print(f"  Client {client_id+1} ({CLIENT_NAMES[client_id]:<12}): "
-              f"{m['auc_roc']:.4f}")
-
-    print(f"\n  Standard FL best central AUC: {best_auc:.4f}")
-    print(f"  Standard FL avg per-client AUC: "
-          f"{np.mean(global_per_client_aucs):.4f}")
-    return (best_auc, round_aucs, global_model,
-            best_weights, global_per_client_aucs)
-
-# ── Personalisation — runs all 3 variants ─────────────────────────────────
-def run_personalisation(variant_name, global_model, best_weights,
-                         train_loaders, val_loaders, client_test_loaders,
-                         device, class_weights_list,
-                         epochs, lr, freeze_lora=False, use_fedprox=False):
+def train_local_standard(model, loader, optimizer, device,
+                          class_weights, epochs, label,
+                          run_start, variant_start, client_id,
+                          total_clients, variant_num, total_variants):
     """
-    Unified personalisation function for all 3 variants.
-
-    variant_name : label for printing
-    freeze_lora  : if True, only classifier head trains (Variant 2)
-    use_fedprox  : if True, adds proximal term to loss (Variant 3)
-
-    Each client:
-      1. Starts from best global model weights
-      2. Fine-tunes on LOCAL training data
-      3. Evaluated on its OWN client test set (correct pFL evaluation)
+    Trains for `epochs` epochs. Prints per-epoch loss and timing.
+    No val or test access inside this function.
     """
-    print(f"\n{'='*70}")
-    print(f"PERSONALISATION: {variant_name}")
-    print(f"  epochs={epochs}, lr={lr}, "
-          f"freeze_lora={freeze_lora}, use_fedprox={use_fedprox}")
-    print(f"  Each client evaluated on its OWN pathogen test set")
-    print(f"{'='*70}\n")
+    model.train()
+    criterion  = torch.nn.CrossEntropyLoss(weight=class_weights)
+    epoch_logs = []
 
-    # For FedProx: store global weights on CPU once
-    if use_fedprox:
-        global_weights_cpu = {n: p.cpu().clone()
-                              for n, p in global_model.named_parameters()
-                              if p.requires_grad}
+    for epoch in range(epochs):
+        epoch_start = time.time()
+        total_loss  = 0.0
 
-    results = []
+        for batch in loader:
+            input_ids      = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels         = batch["labels"].to(device)
+            optimizer.zero_grad()
+            loss = criterion(
+                model(input_ids=input_ids,
+                      attention_mask=attention_mask).logits,
+                labels,
+            )
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        avg_loss   = total_loss / max(len(loader), 1)
+        epoch_time = time.time() - epoch_start
+        epoch_logs.append(avg_loss)
+
+        elapsed     = time.time() - run_start
+        done_epochs = (
+            (variant_num - 1) * total_clients * epochs
+            + client_id * epochs
+            + (epoch + 1)
+        )
+        total_epochs = total_variants * total_clients * epochs
+        avg_ep_time  = (time.time() - variant_start) / max(done_epochs - (variant_num - 1) * total_clients * epochs, 1)
+        eta          = avg_ep_time * (total_epochs - done_epochs)
+
+        print(
+            f"  [{label} | Epoch {epoch + 1}/{epochs}] "
+            f"Loss: {avg_loss:.4f} | "
+            f"Epoch time: {format_seconds(epoch_time)} | "
+            f"Elapsed: {format_seconds(elapsed)} | "
+            f"ETA: {format_seconds(eta)}"
+        )
+
+    return epoch_logs
+
+
+def train_local_fedprox(model, loader, optimizer, device,
+                         class_weights, epochs, global_weights_cpu,
+                         mu, label,
+                         run_start, variant_start, client_id,
+                         total_clients, variant_num, total_variants):
+    """FedProx training with proximal term. No val or test access."""
+    model.train()
+    criterion         = torch.nn.CrossEntropyLoss(weight=class_weights)
+    global_weights_gpu = {n: w.to(device) for n, w in global_weights_cpu.items()}
+    epoch_logs        = []
+
+    for epoch in range(epochs):
+        epoch_start = time.time()
+        total_ce    = 0.0
+
+        for batch in loader:
+            input_ids      = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels         = batch["labels"].to(device)
+            optimizer.zero_grad()
+            ce_loss = criterion(
+                model(input_ids=input_ids,
+                      attention_mask=attention_mask).logits,
+                labels,
+            )
+            prox_loss = sum(
+                ((p - global_weights_gpu[n]) ** 2).sum()
+                for n, p in model.named_parameters()
+                if p.requires_grad and n in global_weights_gpu
+            )
+            loss = ce_loss + (mu / 2) * prox_loss
+            loss.backward()
+            optimizer.step()
+            total_ce += ce_loss.item()
+
+        avg_ce     = total_ce / max(len(loader), 1)
+        epoch_time = time.time() - epoch_start
+        epoch_logs.append(avg_ce)
+
+        elapsed     = time.time() - run_start
+        done_epochs = (
+            (variant_num - 1) * total_clients * epochs
+            + client_id * epochs
+            + (epoch + 1)
+        )
+        total_epochs = total_variants * total_clients * epochs
+        avg_ep_time  = (time.time() - variant_start) / max(done_epochs - (variant_num - 1) * total_clients * epochs, 1)
+        eta          = avg_ep_time * (total_epochs - done_epochs)
+
+        print(
+            f"  [{label} | Epoch {epoch + 1}/{epochs}] "
+            f"CE Loss: {avg_ce:.4f} | "
+            f"Epoch time: {format_seconds(epoch_time)} | "
+            f"Elapsed: {format_seconds(elapsed)} | "
+            f"ETA: {format_seconds(eta)}"
+        )
+
+    return epoch_logs
+
+
+# ============================================================
+# DataLoader factory — seeded
+# ============================================================
+
+def make_loader(dataset, batch_size, shuffle, args, generator=None):
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=args.num_workers,
+        worker_init_fn=seed_worker if args.num_workers > 0 else None,
+        generator=generator,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+# ============================================================
+# pFL core: one variant across all clients
+#
+# Key design decisions (no test-set leakage):
+#   - Global federated checkpoint loaded from --fed_checkpoint
+#   - Val set used ONLY to pick the best personalised checkpoint
+#   - Client test set evaluated ONCE after best checkpoint is loaded
+#   - Central test set is NEVER accessed in this script
+# ============================================================
+
+def run_personalisation(
+    variant_name,
+    variant_num,
+    total_variants,
+    global_weights,
+    lora_rank,
+    train_loaders,
+    val_loaders,
+    client_test_loaders,
+    device,
+    class_weights_list,
+    epochs,
+    lr,
+    freeze_lora,
+    use_fedprox,
+    args,
+    run_start,
+    results_dir,
+    live_rows,
+):
+    print(f"\n{'=' * 80}")
+    print(f"PERSONALISATION VARIANT {variant_num}/{total_variants}: {variant_name}")
+    print(f"  epochs={epochs} | lr={lr} | "
+          f"freeze_lora={freeze_lora} | use_fedprox={use_fedprox}")
+    print(
+        "  Checkpoint selection: best val AUC per client\n"
+        "  Test evaluation: client-specific test set, ONCE after best ckpt loaded\n"
+        "  Central test set: NOT accessed here"
+    )
+    print(f"{'=' * 80}\n")
+
+    global_weights_cpu = (
+        {n: w.cpu().clone() for n, w in global_weights.items()}
+        if use_fedprox else None
+    )
+
+    variant_start = time.time()
+    client_times  = []
+    results       = []
+
     for client_id in range(NUM_CLIENTS):
-        personal_model = copy.deepcopy(global_model)
-        personal_model = set_trainable_weights(personal_model, best_weights)
+        client_start = time.time()
+
+        print(f"\n{'-' * 80}")
+        print(
+            f"[{variant_name} | Client {client_id + 1}/{NUM_CLIENTS} "
+            f"{CLIENT_NAMES[client_id]}]"
+        )
+        print(f"{'-' * 80}")
+
+        # Build fresh model and load global checkpoint
+        personal_model = build_model(lora_rank).to(device)
+        personal_model = set_trainable_weights(personal_model, global_weights)
 
         if freeze_lora:
-            # Variant 2: freeze LoRA, only classifier trains
+            # pFL-CLF: freeze LoRA, train head only
+            clf_names = get_classifier_param_names(personal_model)
             for n, p in personal_model.named_parameters():
-                p.requires_grad = (n in CLASSIFIER_PARAM_NAMES)
-            trainable_count = sum(p.numel()
-                                  for p in personal_model.parameters()
-                                  if p.requires_grad)
-            assert trainable_count == (480*480 + 480 + 2*480 + 2), \
-                f"Classifier freeze incorrect: {trainable_count} params"
-            optimizer = torch.optim.AdamW(
-                [p for p in personal_model.parameters()
-                 if p.requires_grad], lr=lr)
+                p.requires_grad = (n in clf_names)
+            print_trainable_summary(personal_model,
+                                    f"CLF-only client {client_id + 1}")
         else:
-            optimizer = torch.optim.AdamW(
-                personal_model.parameters(), lr=lr)
+            print_trainable_summary(personal_model,
+                                    f"Full client {client_id + 1}")
 
-        # Before personalisation — evaluate on client test set
-        m_before = evaluate(personal_model,
-                            client_test_loaders[client_id], device)
-        print(f"  Client {client_id+1} ({CLIENT_NAMES[client_id]:<12}) "
-              f"BEFORE: client test AUC={m_before['auc_roc']:.4f}")
+        optimizer = torch.optim.AdamW(
+            [p for p in personal_model.parameters() if p.requires_grad],
+            lr=lr,
+        )
 
-        # Train
+        # Val-based checkpoint selection: track best val AUC during training
+        best_val_auc   = -np.inf
+        best_state     = None
+        val_trajectory = []
+
+        # ── Per-epoch training loop with inline val ──────────────────────
+        criterion = torch.nn.CrossEntropyLoss(weight=class_weights_list[client_id])
         if use_fedprox:
-            train_local_fedprox(
-                personal_model, train_loaders[client_id], optimizer,
-                device, class_weights_list[client_id], epochs,
-                global_weights_cpu, MU,
-                f"{variant_name} Client {client_id+1} "
-                f"{CLIENT_NAMES[client_id]}")
-        else:
-            train_local_standard(
-                personal_model, train_loaders[client_id], optimizer,
-                device, class_weights_list[client_id], epochs,
-                f"{variant_name} Client {client_id+1} "
-                f"{CLIENT_NAMES[client_id]}")
+            global_weights_gpu = {n: w.to(device) for n, w in global_weights_cpu.items()}
 
-        # After personalisation — evaluate on client test set
-        m_after = evaluate(personal_model,
-                           client_test_loaders[client_id], device)
-        m_val   = evaluate(personal_model,
-                           val_loaders[client_id], device)
-        print(f"  Client {client_id+1} ({CLIENT_NAMES[client_id]:<12}) "
-              f"AFTER:  client test AUC={m_after['auc_roc']:.4f} | "
-              f"val AUC={m_val['auc_roc']:.4f} | "
-              f"improvement={m_after['auc_roc']-m_before['auc_roc']:+.4f}")
+        for epoch in range(epochs):
+            epoch_start = time.time()
+            personal_model.train()
+            total_loss = 0.0
+
+            for batch in train_loaders[client_id]:
+                input_ids      = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels         = batch["labels"].to(device)
+                optimizer.zero_grad()
+
+                ce_loss = criterion(
+                    personal_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                    ).logits,
+                    labels,
+                )
+
+                if use_fedprox:
+                    prox = sum(
+                        ((p - global_weights_gpu[n]) ** 2).sum()
+                        for n, p in personal_model.named_parameters()
+                        if p.requires_grad and n in global_weights_gpu
+                    )
+                    loss = ce_loss + (MU / 2) * prox
+                else:
+                    loss = ce_loss
+
+                loss.backward()
+                optimizer.step()
+                total_loss += ce_loss.item()
+
+            avg_loss  = total_loss / max(len(train_loaders[client_id]), 1)
+            epoch_dur = time.time() - epoch_start
+
+            # Evaluate on val set for checkpoint selection
+            val_metrics = evaluate(personal_model, val_loaders[client_id], device)
+            val_trajectory.append(val_metrics["auc_roc"])
+
+            elapsed = time.time() - run_start
+            done_ep = (variant_num - 1) * NUM_CLIENTS * epochs + client_id * epochs + (epoch + 1)
+            total_ep = total_variants * NUM_CLIENTS * epochs
+            if done_ep > 0:
+                avg_ep = (time.time() - variant_start) / done_ep
+                eta    = avg_ep * (total_ep - done_ep)
+            else:
+                eta = float("inf")
+
+            print(
+                f"  [{variant_name} | Client {client_id + 1} "
+                f"{CLIENT_NAMES[client_id]:<12} | Epoch {epoch + 1}/{epochs}] "
+                f"Loss: {avg_loss:.4f} | "
+                f"Val AUC-ROC: {val_metrics['auc_roc']:.4f} | "
+                f"Epoch time: {format_seconds(epoch_dur)} | "
+                f"Elapsed: {format_seconds(elapsed)} | "
+                f"ETA: {format_seconds(eta)}"
+            )
+
+            # Save best val checkpoint — test set never seen here
+            if not np.isnan(val_metrics["auc_roc"]) and val_metrics["auc_roc"] > best_val_auc:
+                best_val_auc = val_metrics["auc_roc"]
+                best_state   = copy.deepcopy(personal_model.state_dict())
+
+        # Load best val checkpoint
+        if best_state is not None:
+            personal_model.load_state_dict(best_state)
+        print(
+            f"  [{variant_name} | Client {client_id + 1}] "
+            f"Best val AUC: {best_val_auc:.4f} (epoch "
+            f"{int(np.argmax(val_trajectory)) + 1})"
+        )
+
+        # Evaluate on client-specific test set ONCE
+        test_metrics = evaluate(
+            personal_model, client_test_loaders[client_id], device
+        )
+        print(
+            f"  [{variant_name} | Client {client_id + 1} "
+            f"{CLIENT_NAMES[client_id]:<12}] "
+            f"Client test AUC-ROC: {test_metrics['auc_roc']:.4f} | "
+            f"AUC-PR: {test_metrics['auc_pr']:.4f} | "
+            f"F1: {test_metrics['f1']:.4f} | "
+            f"MCC: {test_metrics['mcc']:.4f}"
+        )
 
         results.append({
-            'before': m_before['auc_roc'],
-            'after':  m_after['auc_roc'],
-            'f1':     m_after['f1'],
-            'mcc':    m_after['mcc'],
-            'auc_pr': m_after['auc_pr'],
+            "variant":      variant_name,
+            "client_id":    client_id + 1,
+            "client_name":  CLIENT_NAMES[client_id],
+            "best_val_auc": best_val_auc,
+            "auc_roc":      test_metrics["auc_roc"],
+            "auc_pr":       test_metrics["auc_pr"],
+            "f1":           test_metrics["f1"],
+            "mcc":          test_metrics["mcc"],
         })
+        live_rows.append(results[-1])
+
+        client_time = time.time() - client_start
+        client_times.append(client_time)
+
+        # Progress monitor
+        print()
+        print("  Progress monitor")
+        print(
+            f"    Variant {variant_num}/{total_variants} | "
+            f"Client {client_id + 1}/{NUM_CLIENTS} "
+            f"({CLIENT_NAMES[client_id]})"
+        )
+        print(f"    Client time    : {format_seconds(client_time)}")
+        print(f"    Elapsed        : {format_seconds(time.time() - run_start)}")
+        remaining = (NUM_CLIENTS - client_id - 1) + (total_variants - variant_num) * NUM_CLIENTS
+        avg_ct = sum(client_times) / len(client_times)
+        print(f"    ETA            : {format_seconds(avg_ct * remaining)}")
+        print_gpu_memory()
+
+        # Live save after every client
+        live_path = os.path.join(results_dir, "pfl_results_live.csv")
+        pd.DataFrame(live_rows).to_csv(live_path, index=False)
+        print(f"    Live results   : {live_path}")
+
+        # Save this client's personalised weights
+        ckpt_name = (
+            f"pfl_{variant_name.split()[0].lower()}_"
+            f"client{client_id + 1}.pt"
+        )
+        torch.save(
+            {n: p.data.clone() for n, p in personal_model.named_parameters()
+             if p.requires_grad},
+            os.path.join(results_dir, ckpt_name),
+        )
+
         del personal_model
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    avg_before = np.mean([r['before'] for r in results])
-    avg_after  = np.mean([r['after']  for r in results])
-    print(f"\n  {variant_name} avg client test AUC: "
-          f"{avg_before:.4f} → {avg_after:.4f} "
-          f"({avg_after - avg_before:+.4f})")
-    return results, avg_after
+    avg_auc = float(np.mean([r["auc_roc"] for r in results]))
+    print(f"\n  {variant_name} — avg client test AUC-ROC: {avg_auc:.4f}")
+    return results, avg_auc
 
-# ── Main ───────────────────────────────────────────────────────────────────
-if __name__ == '__main__':
-    device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    tokenizer = AutoTokenizer.from_pretrained('facebook/esm2_t12_35M_UR50D')
-    print(f"Device: {device}\n")
 
-    os.makedirs('results', exist_ok=True)
-    os.makedirs('figures', exist_ok=True)
-    os.makedirs('tables',  exist_ok=True)
+# ============================================================
+# Main
+# ============================================================
 
-    # ── Pre-flight checks ──────────────────────────────────────────────────
-    print("Running pre-flight checks...")
-    test_model = build_model()
-    actual_clf = {n for n, p in test_model.named_parameters()
-                  if p.requires_grad and 'classifier' in n}
-    assert actual_clf == CLASSIFIER_PARAM_NAMES, \
-        f"Classifier mismatch: {actual_clf}"
-    print("  ✅ Classifier param names verified")
-    total = sum(p.numel() for p in test_model.parameters()
-                if p.requires_grad)
-    assert total == 416162, f"Expected 416162, got {total}"
-    print(f"  ✅ Trainable params: {total:,}")
-    m2  = copy.deepcopy(test_model)
-    gw  = {n: p.data.clone() for n, p in test_model.named_parameters()
-           if p.requires_grad}
-    prx = sum(((p - gw[n]) ** 2).sum()
-              for n, p in m2.named_parameters()
-              if p.requires_grad and n in gw)
-    assert prx.item() < 1e-6
-    print("  ✅ FedProx proximal term verified")
-    del test_model, m2, gw
-    missing = []
-    for i in range(1, 6):
-        for s in ['train', 'val', 'test']:
-            f = f'data/client{i}_{s}.csv'
-            if not os.path.exists(f):
-                missing.append(f)
-    for f in ['data/central_test.csv', 'results/baseline_results.csv']:
-        if not os.path.exists(f):
-            missing.append(f)
-    assert not missing, f"Missing: {missing}"
-    print("  ✅ All data files present")
-    print("  ✅ All checks passed\n")
+def main(args):
+    run_start = time.time()
 
-    # ── Build dataloaders ──────────────────────────────────────────────────
-    train_loaders, val_loaders       = [], []
-    client_test_loaders              = []
-    class_weights_list, client_sizes = [], []
+    set_seed(args.seed)
+    check_required_files(args.fed_checkpoint)
+    os.makedirs(args.results_dir, exist_ok=True)
 
-    for i in range(NUM_CLIENTS):
-        tr  = EpitopeDataset(CLIENT_TRAIN_FILES[i], tokenizer)
-        va  = EpitopeDataset(CLIENT_VAL_FILES[i],   tokenizer)
-        ct  = EpitopeDataset(CLIENT_TEST_FILES[i],  tokenizer)
-        df  = pd.read_csv(CLIENT_TRAIN_FILES[i])
-        pos = df['label'].sum()
-        neg = len(df) - pos
-        train_loaders.append(
-            DataLoader(tr, batch_size=BATCH_SIZE,
-                       shuffle=True, num_workers=4))
-        val_loaders.append(
-            DataLoader(va, batch_size=128,
-                       shuffle=False, num_workers=4))
-        client_test_loaders.append(
-            DataLoader(ct, batch_size=128,
-                       shuffle=False, num_workers=4))
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained("facebook/esm2_t12_35M_UR50D")
+
+    print("=" * 80)
+    print("FedEpitope — Personalised Federated Learning")
+    print("=" * 80)
+    print(f"Device              : {device}")
+    print(f"Seed                : {args.seed}")
+    print(f"LoRA rank           : {args.lora_rank}   alpha: {2 * args.lora_rank}")
+    print(f"Federated checkpoint: {args.fed_checkpoint}")
+    print(f"pFL epochs          : {PERSONAL_EPOCHS}")
+    print(f"Results dir         : {args.results_dir}")
+    print(
+        "Test-set rule       : client test set evaluated ONCE per client,\n"
+        "                      after val-based checkpoint selection.\n"
+        "                      Central test set NOT accessed here."
+    )
+    print("=" * 80)
+    print()
+
+    print_gpu_memory()
+    print()
+
+    # ── Build data loaders ────────────────────────────────────────────────
+    train_loaders      = []
+    val_loaders        = []
+    client_test_loaders = []
+    class_weights_list = []
+    client_sizes       = []
+
+    for client_id in range(NUM_CLIENTS):
+        gen = torch.Generator()
+        gen.manual_seed(args.seed + client_id)
+
+        train_ds = EpitopeDataset(CLIENT_TRAIN_FILES[client_id], tokenizer)
+        val_ds   = EpitopeDataset(CLIENT_VAL_FILES[client_id],   tokenizer)
+        test_ds  = EpitopeDataset(CLIENT_TEST_FILES[client_id],  tokenizer)
+
+        train_df = pd.read_csv(CLIENT_TRAIN_FILES[client_id])
+        pos      = int(train_df["label"].sum())
+        neg      = int(len(train_df) - pos)
+
+        train_loaders.append(make_loader(train_ds, BATCH_SIZE, True,  args, gen))
+        val_loaders.append(  make_loader(val_ds,   128,        False, args))
+        client_test_loaders.append(make_loader(test_ds, 128, False, args))
+
         class_weights_list.append(
-            torch.tensor([1.0, neg / max(pos, 1)],
-                         dtype=torch.float).to(device))
-        client_sizes.append(len(tr))
-        print(f"Client {i+1} ({CLIENT_NAMES[i]:<12}): "
-              f"train={len(tr):>7}, val={len(va):>6}, "
-              f"client_test={len(ct):>6}, pos%={pos/len(df):.1%}")
+            torch.tensor([1.0, neg / max(pos, 1)], dtype=torch.float).to(device)
+        )
+        client_sizes.append(len(train_ds))
 
-    central_test_ds     = EpitopeDataset('data/central_test.csv', tokenizer)
-    central_test_loader = DataLoader(central_test_ds, batch_size=128,
-                                     shuffle=False, num_workers=4)
-    print(f"Central test set: {len(central_test_ds)} samples\n")
+        print(
+            f"Client {client_id + 1} ({CLIENT_NAMES[client_id]:<12}) | "
+            f"Train: {len(train_ds):>7,} | Val: {len(val_ds):>6,} | "
+            f"Test: {len(test_ds):>6,} | "
+            f"Pos rate: {pos / max(len(train_df), 1):.2%}"
+        )
 
-    # Load single-client baselines — evaluated on central test (from Phase 5)
-    baseline_df = pd.read_csv('results/baseline_results.csv', index_col=0)
-    single_central_aucs = [
-        baseline_df.loc['Single_Client1_Coronavirus', 'auc_roc'],
-        baseline_df.loc['Single_Client2_Parasite',    'auc_roc'],
-        baseline_df.loc['Single_Client3_Human',        'auc_roc'],
-        baseline_df.loc['Single_Client4_Flavivirus',   'auc_roc'],
-        baseline_df.loc['Single_Client5_Bacteria',     'auc_roc'],
+    print()
+
+    # ── Load global federated checkpoint ─────────────────────────────────
+    print(f"Loading global federated checkpoint: {args.fed_checkpoint}")
+    global_weights = torch.load(args.fed_checkpoint, map_location="cpu")
+
+    # Verify the checkpoint fits the model
+    ref_model = build_model(args.lora_rank)
+    print_trainable_summary(ref_model, f"Reference model (r={args.lora_rank})")
+    missing = [k for k in get_trainable_weights(ref_model) if k not in global_weights]
+    extra   = [k for k in global_weights if k not in get_trainable_weights(ref_model)]
+    if missing:
+        print(f"  WARNING: {len(missing)} keys missing from checkpoint")
+    if extra:
+        print(f"  WARNING: {len(extra)} unexpected keys in checkpoint")
+    if not missing and not extra:
+        print("  Checkpoint keys verified ✓")
+    del ref_model
+    print()
+
+    # ── Run three pFL variants ────────────────────────────────────────────
+    VARIANTS = [
+        dict(
+            variant_name="pFL-LFT",
+            epochs=PERSONAL_EPOCHS,
+            lr=PERSONAL_LR_LFT,
+            freeze_lora=False,
+            use_fedprox=False,
+        ),
+        dict(
+            variant_name="pFL-CLF-Only",
+            epochs=PERSONAL_EPOCHS,
+            lr=PERSONAL_LR_CLF,
+            freeze_lora=True,
+            use_fedprox=False,
+        ),
+        dict(
+            variant_name="pFL-FedProx",
+            epochs=PERSONAL_EPOCHS,
+            lr=PERSONAL_LR_FPX,
+            freeze_lora=False,
+            use_fedprox=True,
+        ),
     ]
+    TOTAL_VARIANTS = len(VARIANTS)
 
-    # ── Phase 1: Standard FL ──────────────────────────────────────────────
-    (std_central_auc, std_round_aucs, global_model,
-     best_weights, std_per_client_aucs) = run_standard_federated(
-        train_loaders, val_loaders,
-        central_test_loader, client_test_loaders,
-        device, class_weights_list, client_sizes)
+    all_results = {}
+    live_rows   = []   # accumulates across all variants for live CSV
 
-    torch.save(best_weights, 'results/pfl_v2_global_model.pt')
+    for variant_num, vkwargs in enumerate(VARIANTS, start=1):
+        results, avg_auc = run_personalisation(
+            variant_num=variant_num,
+            total_variants=TOTAL_VARIANTS,
+            global_weights=global_weights,
+            lora_rank=args.lora_rank,
+            train_loaders=train_loaders,
+            val_loaders=val_loaders,
+            client_test_loaders=client_test_loaders,
+            device=device,
+            class_weights_list=class_weights_list,
+            args=args,
+            run_start=run_start,
+            results_dir=args.results_dir,
+            live_rows=live_rows,
+            **vkwargs,
+        )
+        all_results[vkwargs["variant_name"]] = (results, avg_auc)
 
-    # ── Phase 2: Three personalisation variants ────────────────────────────
-    # Each variant evaluated on per-client test sets
-    v1_results, v1_avg = run_personalisation(
-        'pFL-LFT (lr=1e-5, 10 epochs)',
-        global_model, best_weights,
-        train_loaders, val_loaders, client_test_loaders,
-        device, class_weights_list,
-        epochs=PERSONAL_EPOCHS_V1, lr=PERSONAL_LR_V1,
-        freeze_lora=False, use_fedprox=False)
+    # ── Build per-client summary CSV ──────────────────────────────────────
+    per_client_rows = []
+    for client_id in range(NUM_CLIENTS):
+        row = {
+            "seed":        args.seed,
+            "lora_rank":   args.lora_rank,
+            "client_id":   client_id + 1,
+            "client_name": CLIENT_NAMES[client_id],
+        }
+        for vname, (res, _) in all_results.items():
+            row[f"{vname}_auc_roc"] = res[client_id]["auc_roc"]
+            row[f"{vname}_auc_pr"]  = res[client_id]["auc_pr"]
+            row[f"{vname}_f1"]      = res[client_id]["f1"]
+            row[f"{vname}_mcc"]     = res[client_id]["mcc"]
+            row[f"{vname}_val_auc"] = res[client_id]["best_val_auc"]
+        per_client_rows.append(row)
 
-    v2_results, v2_avg = run_personalisation(
-        'pFL-CLF-Only (lr=1e-4, 10 epochs)',
-        global_model, best_weights,
-        train_loaders, val_loaders, client_test_loaders,
-        device, class_weights_list,
-        epochs=PERSONAL_EPOCHS_V2, lr=PERSONAL_LR_V2,
-        freeze_lora=True, use_fedprox=False)
+    per_client_df = pd.DataFrame(per_client_rows)
+    per_client_path = os.path.join(args.results_dir, "pfl_per_client.csv")
+    per_client_df.to_csv(per_client_path, index=False)
 
-    v3_results, v3_avg = run_personalisation(
-        f'pFL-FedProx (lr=1e-5, 10 epochs, mu={MU})',
-        global_model, best_weights,
-        train_loaders, val_loaders, client_test_loaders,
-        device, class_weights_list,
-        epochs=PERSONAL_EPOCHS_V3, lr=PERSONAL_LR_V3,
-        freeze_lora=False, use_fedprox=True)
+    # Full detail CSV
+    detail_df   = pd.DataFrame(live_rows)
+    detail_path = os.path.join(args.results_dir, "pfl_results.csv")
+    detail_df.to_csv(detail_path, index=False)
 
-    # ── Collect results ────────────────────────────────────────────────────
-    v1_aucs = [r['after'] for r in v1_results]
-    v2_aucs = [r['after'] for r in v2_results]
-    v3_aucs = [r['after'] for r in v3_results]
+    # ── Final summary ─────────────────────────────────────────────────────
+    total_time = time.time() - run_start
+    print("\n" + "=" * 80)
+    print("PERSONALISED FL — FINAL SUMMARY")
+    print("(All AUC-ROC values on per-client pathogen-specific test sets)")
+    print("=" * 80)
 
-    # ── Save per-client results ────────────────────────────────────────────
-    per_client_df = pd.DataFrame({
-        'Client':            CLIENT_NAMES,
-        'Local_Only_central':[round(a, 4) for a in single_central_aucs],
-        'StdFL_client_test': [round(a, 4) for a in std_per_client_aucs],
-        'pFL_LFT':           [round(a, 4) for a in v1_aucs],
-        'pFL_CLF_Only':      [round(a, 4) for a in v2_aucs],
-        'pFL_FedProx':       [round(a, 4) for a in v3_aucs],
-    })
-    per_client_df.to_csv('results/pfl_v2_per_client.csv', index=False)
-    pd.DataFrame({'round': list(range(1, NUM_ROUNDS+1)),
-                  'standard_fl': std_round_aucs
-                  }).to_csv('results/pfl_v2_rounds.csv', index=False)
+    print(f"\n{'Variant':<20} {'Avg AUC-ROC':>12}")
+    print("-" * 35)
+    for vname, (_, avg) in all_results.items():
+        print(f"{vname:<20} {avg:>12.4f}")
 
-    # ── Figure 1: Per-client test AUC — all methods ────────────────────────
-    print("\nGenerating figures...")
-    fig, ax   = plt.subplots(figsize=(14, 6))
-    x         = np.arange(NUM_CLIENTS)
-    width     = 0.15
-    data_list = [
-        (std_per_client_aucs, 'Standard FL (client test)',  'coral'),
-        (v1_aucs,             'pFL LFT',                    'mediumseagreen'),
-        (v2_aucs,             'pFL Classifier-Only',        'gold'),
-        (v3_aucs,             'pFL FedProx',                'mediumpurple'),
-    ]
-    offsets = [-1.5, -0.5, 0.5, 1.5]
-    for (data, label, color), offset in zip(data_list, offsets):
-        bars = ax.bar(x + offset * width, data, width,
-                      label=label, color=color, alpha=0.85)
-        for bar in bars:
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.003,
-                    f'{bar.get_height():.3f}',
-                    ha='center', va='bottom', fontsize=8)
-    ax.set_xlabel('Client', fontsize=13)
-    ax.set_ylabel('AUC-ROC (Per-Client Test Set)', fontsize=13)
-    ax.set_title('Personalised FL: Per-Client Test AUC\n'
-                 '(Each model evaluated on its own pathogen test set)',
-                 fontsize=12)
-    ax.set_xticks(x)
-    ax.set_xticklabels(CLIENT_NAMES, fontsize=11)
-    ax.set_ylim(0.50, 1.00)
-    ax.legend(fontsize=10, loc='upper right')
-    ax.grid(True, alpha=0.3, axis='y')
-    plt.tight_layout()
-    plt.savefig('figures/figure_pfl_v2_per_client.png',
-                dpi=300, bbox_inches='tight')
-    plt.close()
+    print(f"\nPer-client breakdown:")
+    header = f"{'Client':<14}"
+    for vname in all_results:
+        header += f"  {vname:>12}"
+    print(header)
+    print("-" * (14 + 14 * TOTAL_VARIANTS))
+    for client_id in range(NUM_CLIENTS):
+        row_str = f"{CLIENT_NAMES[client_id]:<14}"
+        for vname, (res, _) in all_results.items():
+            row_str += f"  {res[client_id]['auc_roc']:>12.4f}"
+        print(row_str)
 
-    # ── Figure 2: Average AUC summary ─────────────────────────────────────
-    std_avg    = np.mean(std_per_client_aucs)
-    central_auc = baseline_df.loc['Centralised_LoRA', 'auc_roc']
-    methods    = ['Std FL\n(client test)', 'pFL LFT',
-                  'pFL CLF-Only', 'pFL FedProx']
-    avg_aucs   = [round(std_avg, 4), round(v1_avg, 4),
-                  round(v2_avg, 4),  round(v3_avg, 4)]
-    bar_colors = ['coral', 'mediumseagreen', 'gold', 'mediumpurple']
-    fig, ax    = plt.subplots(figsize=(9, 6))
-    bars       = ax.bar(methods, avg_aucs, color=bar_colors, alpha=0.85)
-    for bar in bars:
-        ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.003,
-                f'{bar.get_height():.4f}',
-                ha='center', va='bottom', fontsize=11)
-    ax.set_ylabel('Avg AUC-ROC (Per-Client Test Sets)', fontsize=13)
-    ax.set_title('Personalised FL: Average Per-Client Performance',
-                 fontsize=13)
-    ax.set_ylim(0.50, 1.00)
-    ax.grid(True, alpha=0.3, axis='y')
-    plt.tight_layout()
-    plt.savefig('figures/figure_pfl_v2_summary.png',
-                dpi=300, bbox_inches='tight')
-    plt.close()
+    print(f"\nTotal run time   : {format_seconds(total_time)}")
+    print(f"Saved results    : {per_client_path}")
+    print(f"Saved detail     : {detail_path}")
+    print("=" * 80)
 
-    # ── Figure 3: Standard FL convergence (central test) ──────────────────
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(range(1, NUM_ROUNDS+1), std_round_aucs,
-            'b-o', markersize=4, linewidth=2, label='Standard FL')
-    ax.axhline(y=central_auc, color='green', linestyle='--', linewidth=2,
-               label=f'Centralised upper bound ({central_auc:.4f})')
-    ax.axhline(y=std_avg, color='coral', linestyle=':',  linewidth=2,
-               label=f'Std FL avg per-client ({std_avg:.4f})')
-    ax.axhline(y=v1_avg,  color='mediumseagreen', linestyle=':', linewidth=2,
-               label=f'pFL LFT avg ({v1_avg:.4f})')
-    ax.axhline(y=v2_avg,  color='gold', linestyle='-.', linewidth=2,
-               label=f'pFL CLF-Only avg ({v2_avg:.4f})')
-    ax.axhline(y=v3_avg,  color='mediumpurple', linestyle=':', linewidth=2,
-               label=f'pFL FedProx avg ({v3_avg:.4f})')
-    ax.set_xlabel('Federated Round', fontsize=13)
-    ax.set_ylabel('AUC-ROC', fontsize=13)
-    ax.set_title('Standard FL Convergence + Personalisation Results',
-                 fontsize=13)
-    ax.legend(fontsize=9)
-    ax.set_xlim(1, NUM_ROUNDS)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig('figures/figure_pfl_v2_convergence.png',
-                dpi=300, bbox_inches='tight')
-    plt.close()
-    print("  Saved 3 figures")
 
-    # ── Final summary ──────────────────────────────────────────────────────
-    print("\n" + "="*70)
-    print("PERSONALISED FL v2 FINAL SUMMARY")
-    print("Note: pFL variants evaluated on per-client test sets")
-    print("      Standard FL also shown on per-client test sets for fair comparison")
-    print("="*70)
-    print(f"\n{'Method':<30} {'Avg per-client AUC':>20} {'vs StdFL':>10}")
-    print("-"*62)
-    for method, avg in [
-        ('Standard FL (client test)', std_avg),
-        ('pFL LFT',                   v1_avg),
-        ('pFL Classifier-Only',       v2_avg),
-        ('pFL FedProx',               v3_avg),
-    ]:
-        print(f"{method:<30} {avg:>20.4f} {avg-std_avg:>+10.4f}")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
 
-    print(f"\nPer-client breakdown (client test AUC):")
-    print(f"{'Client':<13} {'StdFL':>8} {'LFT':>8} "
-          f"{'CLF':>8} {'FedProx':>9} {'Best pFL':>10}")
-    print("-"*60)
-    for i in range(NUM_CLIENTS):
-        best_pfl = max(v1_aucs[i], v2_aucs[i], v3_aucs[i])
-        print(f"{CLIENT_NAMES[i]:<13} "
-              f"{std_per_client_aucs[i]:>8.4f} "
-              f"{v1_aucs[i]:>8.4f} "
-              f"{v2_aucs[i]:>8.4f} "
-              f"{v3_aucs[i]:>9.4f} "
-              f"{best_pfl:>10.4f} "
-              f"{'✅' if best_pfl > std_per_client_aucs[i] else '❌'}")
+    parser.add_argument("--seed",           type=int,   default=42)
+    parser.add_argument("--lora_rank",      type=int,   default=2)
+    parser.add_argument("--num_workers",    type=int,   default=4)
+    parser.add_argument(
+        "--fed_checkpoint",
+        type=str,
+        default="results/r2_seed42/best_global_weights.pt",
+        help="Path to best_global_weights.pt from federated_train.py",
+    )
+    parser.add_argument(
+        "--results_dir",
+        type=str,
+        default="results/pfl_seed42",
+    )
 
-    wins = sum(1 for i in range(NUM_CLIENTS)
-               if max(v1_aucs[i], v2_aucs[i], v3_aucs[i])
-               > std_per_client_aucs[i])
-    print(f"\nBest pFL variant outperforms Standard FL: "
-          f"{wins}/{NUM_CLIENTS} clients")
+    args = parser.parse_args()
 
-    print(f"\n✅ Personalised FL v2 complete.")
-    print(f"   Saved: results/pfl_v2_per_client.csv")
-    print(f"   Saved: results/pfl_v2_rounds.csv")
-    print(f"   Saved: figures/figure_pfl_v2_per_client.png")
-    print(f"   Saved: figures/figure_pfl_v2_summary.png")
-    print(f"   Saved: figures/figure_pfl_v2_convergence.png")
+    try:
+        main(args)
+    except Exception as exc:
+        os.makedirs(args.results_dir, exist_ok=True)
+        err_path = os.path.join(args.results_dir, "error_traceback.txt")
+        with open(err_path, "w") as f:
+            f.write(f"pFL run failed:\n\n{exc}\n\nFull traceback:\n")
+            f.write(traceback.format_exc())
+        print(f"\nFailed. Traceback saved to: {err_path}")
+        raise
