@@ -11,12 +11,8 @@ The repository contains training and evaluation scripts for several experiment s
 - local single-client training
 - personalized federated learning variants
 - differential privacy experiments with Opacus
-<<<<<<< HEAD
-- ablation studies over LoRA rank and data partitioning
-=======
 - LoRA rank ablation studies
 - Dirichlet non-IID partitioning experiments
->>>>>>> Updated
 - external validation on a NetBCE test set
 
 ## Project Structure
@@ -27,12 +23,8 @@ The repository contains training and evaluation scripts for several experiment s
 - [local_main.py](local_main.py) – simple local/single-client training example
 - [personalised_fl_v2.py](personalised_fl_v2.py) – personalized federated learning variants
 - [differential_privacy.py](differential_privacy.py) – DP training experiments
-<<<<<<< HEAD
-- [ablation.py](ablation.py) – LoRA rank and robustness ablation studies
-=======
 - [ablation.py](ablation.py) – LoRA rank ablation studies
 - [dirichlet_experiment.py](dirichlet_experiment.py) – Dirichlet non-IID partitioning experiment
->>>>>>> Updated
 - [eval_global_per_client.py](eval_global_per_client.py) – evaluate global checkpoints per client
 - [netbce_validation.py](netbce_validation.py) – external NetBCE validation
 - [preprocess_v2.py](preprocess_v2.py) – preprocessing helper
@@ -111,15 +103,6 @@ python differential_privacy.py --seed 44 --results_dir results/dp_seed44
 
 Use `--epsilon` to run a single epsilon setting, and `inf` for the No-DP baseline.
 
-<<<<<<< HEAD
-### 6. Ablation studies
-
-```bash
-python ablation.py --seed 42 --ranks 4,8,16 --results_dir results/rank_ablation_seed42
-```
-
-The script also supports Dirichlet-based non-IID experiments with its default settings.
-=======
 ### 6. LoRA rank ablation
 
 ```bash
@@ -133,7 +116,6 @@ python dirichlet_experiment.py
 ```
 
 This script evaluates multiple Dirichlet alpha values and client counts and writes outputs to [results/](results/) and [figures/](figures/).
->>>>>>> Updated
 
 ## Evaluation
 
