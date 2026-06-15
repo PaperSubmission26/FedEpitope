@@ -103,19 +103,13 @@ python differential_privacy.py --seed 44 --results_dir results/dp_seed44
 
 Use `--epsilon` to run a single epsilon setting, and `inf` for the No-DP baseline.
 
-### 6. LoRA rank ablation
+### 6. Ablation studies
 
 ```bash
 python ablation.py --seed 42 --ranks 4,8,16 --results_dir results/rank_ablation_seed42
 ```
 
-### 7. Dirichlet non-IID experiment
-
-```bash
-python dirichlet_experiment.py
-```
-
-This script evaluates multiple Dirichlet alpha values and client counts and writes outputs to [results/](results/) and [figures/](figures/).
+The script also supports Dirichlet-based non-IID experiments with its default settings.
 
 ## Evaluation
 
