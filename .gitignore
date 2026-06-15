@@ -29,3 +29,9 @@ wandb/
 .vscode/
 .idea/
 .DS_Store
+
+# Error tracebacks (debug artifacts, shouldn't be in final repo)
+**/error_traceback.txt
+
+# Redundant live-logging duplicates
+*_live.csv

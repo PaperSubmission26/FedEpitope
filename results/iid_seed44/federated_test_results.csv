@@ -1,0 +1,2 @@
+seed,lora_rank,lora_alpha,partition,selected_round,best_val_auc_roc,test_auc_roc,test_auc_pr,test_f1,test_mcc,total_run_time_seconds
+44,2,4,IID,6,0.7959141145265772,0.7989528063255887,0.48438019266971244,0.4926262608293455,0.3629862799731189,23048.450886011124

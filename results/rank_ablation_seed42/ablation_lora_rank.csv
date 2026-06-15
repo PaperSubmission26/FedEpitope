@@ -1,0 +1,2 @@
+seed,lora_rank,lora_alpha,trainable_params,lora_params,classifier_params,comm_mb_total,comm_mb_lora_only,selected_round,best_val_auc,test_auc_roc,test_auc_pr,test_f1,test_mcc
+42,16,32,600482,368640,231842,2.401928,1.47456,9,0.7323473610792247,0.732640060477004,0.3928739600789887,0.4306828573251388,0.27897996163637134

@@ -1,0 +1,2 @@
+seed,lora_rank,selected_round,test_auc_roc,test_auc_pr,test_f1,test_mcc
+42,8,5,0.7428740478198054,0.40747159142283046,0.4384254081860881,0.2928835841481539
