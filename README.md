@@ -11,7 +11,8 @@ The repository contains training and evaluation scripts for several experiment s
 - local single-client training
 - personalized federated learning variants
 - differential privacy experiments with Opacus
-- ablation studies over LoRA rank and data partitioning
+- LoRA rank ablation studies
+- Dirichlet non-IID partitioning experiments
 - external validation on a NetBCE test set
 
 ## Project Structure
@@ -22,7 +23,8 @@ The repository contains training and evaluation scripts for several experiment s
 - [local_main.py](local_main.py) – simple local/single-client training example
 - [personalised_fl_v2.py](personalised_fl_v2.py) – personalized federated learning variants
 - [differential_privacy.py](differential_privacy.py) – DP training experiments
-- [ablation.py](ablation.py) – LoRA rank and robustness ablation studies
+- [ablation.py](ablation.py) – LoRA rank ablation studies
+- [dirichlet_experiment.py](dirichlet_experiment.py) – Dirichlet non-IID partitioning experiment
 - [eval_global_per_client.py](eval_global_per_client.py) – evaluate global checkpoints per client
 - [netbce_validation.py](netbce_validation.py) – external NetBCE validation
 - [preprocess_v2.py](preprocess_v2.py) – preprocessing helper
