@@ -1,4 +1,4 @@
-````markdown
+
 # FedEpitope
 
 FedEpitope is a PyTorch-based repository for peptide epitope prediction using federated learning. It fine-tunes the ESM-2 protein language model with LoRA adapters on client-specific epitope datasets and evaluates the resulting models on in-distribution and external benchmark data.
