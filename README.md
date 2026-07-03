@@ -184,30 +184,6 @@ pip install protobuf==3.20
 pip install h5py==2.10.0
 ```
 
-Verify the environment:
-
-```bash
-python - <<'PY'
-import keras
-import tensorflow as tf
-import h5py
-
-print("Keras:", keras.__version__)
-print("TensorFlow:", tf.__version__)
-print("h5py:", h5py.__version__)
-print("Setup OK")
-PY
-```
-
-Expected versions:
-
-```text
-Keras: 2.3.1
-TensorFlow: 1.15.0
-h5py: 2.10.0
-Setup OK
-```
-
 ### 2. Download the official NetBCE repository
 
 From the parent directory of this repository:
