@@ -460,8 +460,7 @@ def main(args):
     bars2 = ax.bar(x + width / 2, iedb_means, width, yerr=iedb_stds,
                    capsize=4, label="IEDB held-out", color="steelblue", alpha=0.85)
 
-    ax.axhline(y=0.740, color="green", linestyle="--", linewidth=1.5,
-               label="BepiPred-3.0 on IEDB (0.740)")
+    
     ax.axhline(y=0.50, color="grey", linestyle=":", linewidth=1.0,
                label="Random (0.50)")
 
