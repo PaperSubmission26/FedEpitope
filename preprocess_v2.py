@@ -123,20 +123,42 @@ for client_id, cdf in client_dfs.items():
     print(f"  {client_id}: {len(cdf)} sequences, "
           f"{pos_rate:.1%} positive")
 
-# Save client files with 80/20 local split
+# Save client files with 80/10/10 local train/val/test split
 for client_id, cdf in client_dfs.items():
     if len(cdf) < 10:
         print(f"WARNING: {client_id} too small, skipping")
         continue
-    c_train, c_val = train_test_split(
-        cdf, test_size=0.2, random_state=42, stratify=cdf['label']
-    )
-    c_train[['sequence', 'label']].to_csv(
-        f'data/{client_id}_train.csv', index=False)
-    c_val[['sequence', 'label']].to_csv(
-        f'data/{client_id}_val.csv', index=False)
-    print(f"Saved {client_id}: train={len(c_train)}, val={len(c_val)}")
 
+    # First split: 80% train, 20% temporary pool
+    c_train, c_temp = train_test_split(
+        cdf,
+        test_size=0.20,
+        random_state=42,
+        stratify=cdf["label"]
+    )
+
+    # Second split: temporary pool into 10% validation and 10% test
+    c_val, c_test = train_test_split(
+        c_temp,
+        test_size=0.50,
+        random_state=42,
+        stratify=c_temp["label"]
+    )
+
+    c_train[["sequence", "label"]].to_csv(
+        f"data/{client_id}_train.csv", index=False
+    )
+    c_val[["sequence", "label"]].to_csv(
+        f"data/{client_id}_val.csv", index=False
+    )
+    c_test[["sequence", "label"]].to_csv(
+        f"data/{client_id}_test.csv", index=False
+    )
+
+    print(
+        f"Saved {client_id}: "
+        f"train={len(c_train)}, val={len(c_val)}, test={len(c_test)}"
+    )
 # ── IID partitioning ───────────────────────────────────────────────────────
 iid_splits = np.array_split(train_val_df.sample(frac=1, random_state=42), 5)
 for i, split in enumerate(iid_splits):
