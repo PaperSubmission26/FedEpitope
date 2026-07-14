@@ -36,27 +36,8 @@ The repository includes:
 4. The best global round is selected using weighted client validation AUC-ROC.
 5. The held-out central test set is evaluated once after model selection.
 
-The five non-IID clients are:
 
-| Client | Domain      |
-| -----: | ----------- |
-|      1 | Coronavirus |
-|      2 | Parasite    |
-|      3 | Human/Self  |
-|      4 | Flavivirus  |
-|      5 | Bacteria    |
 
-## Main Results
-
-The table below summarizes the committed central-test results over seeds `42`, `43`, and `44`. Values are mean ± sample standard deviation.
-
-| Training setting           |             AUC-ROC |              AUC-PR |                  F1 |                 MCC |
-| -------------------------- | ------------------: | ------------------: | ------------------: | ------------------: |
-| FedEpitope, non-IID FedAvg |     0.7380 ± 0.0038 |     0.3993 ± 0.0038 |     0.4301 ± 0.0177 |     0.2795 ± 0.0243 |
-| IID FedAvg                 |     0.7978 ± 0.0018 |     0.4806 ± 0.0059 | **0.4944 ± 0.0017** |     0.3647 ± 0.0015 |
-| Centralised LoRA           | **0.8009 ± 0.0013** | **0.4857 ± 0.0016** |     0.4937 ± 0.0013 | **0.3653 ± 0.0013** |
-
-Per-seed metrics and auxiliary experiment results are available under [`results/`](results/).
 
 ## Default Configuration
 
@@ -452,32 +433,4 @@ results/netbce_official/NetBCE_predictions.tsv
 * Model files: `*.pt`, `*.pth`, and `*.ckpt` are excluded by `.gitignore`.
 * Committed `results/`: metric tables and summaries, not downloadable trained checkpoints.
 
-## Common Issues
 
-### A downstream script cannot find `best_global_weights.pt`
-
-Run the matching non-IID training command first and confirm that its `--results_dir` matches the downstream path.
-
-### Baseline results from multiple seeds are identical or missing
-
-Pass a seed-specific `--results_dir`. The default output directory in `baseline.py` is always `results/baseline_seed42`, regardless of the value of `--seed`.
-
-### CUDA out-of-memory
-
-Reduce `--batch_size`, set `--num_workers 0`, or run on a GPU with more memory. ESM-2 weights are downloaded and instantiated separately in several experiment loops, so baseline and ablation runs are more demanding than a single training run.
-
-### Hugging Face download fails on a compute node
-
-Download/cache `facebook/esm2_t12_35M_UR50D` on a node with internet access and reuse the same Hugging Face cache on the compute node.
-
-## Citation
-
-Citation metadata will be added after the accompanying paper is publicly available.
-
-## License
-
-No open-source license file is currently included in this repository. Add the intended `LICENSE` file before public release and update this section accordingly.
-
-## Acknowledgements
-
-This project uses ESM-2 through Hugging Face Transformers, LoRA through PEFT, and differential privacy utilities from Opacus. The external baseline evaluation uses the official NetBCE implementation.
