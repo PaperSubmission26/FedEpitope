@@ -1,37 +1,68 @@
-# Python/cache
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
+# Repository bookkeeping
+file_structure.txt
 
-# Logs
-*.log
-wget-log
-wget-log.*
+# Large/raw/generated data
+data/*.fasta
+data/*.tsv
+data/*.txt
+data/dirichlet/
+data/dirichlet_k3/
+data/federated/
+data/federated_iid/
+data/personalization/
+data/external/
 
-# Huge raw dataset
-bcell_full_v3.csv
+# Large/generated experiment folders
+results/dirichlet_*/
+results/dp_eps*/
+results/fedavg_seed*/
+results/fedavg_iid_seed*/
+results/fedprox_seed*/
+results/fedprox_tuning/
+results/lora_rank*/
+results/mmseqs30_both/
+results/bcpreds_external_comparison/
+results/netbce_external_comparison/
+results/netbce_exactclean_comparison/
+results/strict_test_comparison/
 
-# Large model/experiment artifacts
-checkpoints/
-outputs/
-runs/
-wandb/
-*.pt
-*.pth
-*.ckpt
-*.h5
-*.pkl
-*.npy
-*.npz
+# Third-party repositories
+external/
+# Repository bookkeeping
+file_structure.txt
 
-# Private/environment/editor files
-.env
-.vscode/
-.idea/
-.DS_Store
+# Large/raw/generated data
+data/*.fasta
+data/*.tsv
+data/*.txt
+data/dirichlet/
+data/dirichlet_k3/
+data/federated/
+data/federated_iid/
+data/personalization/
+data/external/
 
-# Error tracebacks (debug artifacts, shouldn't be in final repo)
-**/error_traceback.txt
+# Large/generated experiment folders
+results/dirichlet_*/
+results/dp_eps*/
+results/fedavg_seed*/
+results/fedavg_iid_seed*/
+results/fedprox_seed*/
+results/fedprox_tuning/
+results/lora_rank*/
+results/mmseqs30_both/
+results/bcpreds_external_comparison/
+results/netbce_external_comparison/
+results/netbce_exactclean_comparison/
+results/strict_test_comparison/
 
-# Redundant live-logging duplicates
-*_live.csv
+# Third-party repositories
+external/
+
+# Per-run baseline and personalisation outputs
+results/baseline_seed*/
+results/pfl_seed*/
+
+# Large split metadata archived separately
+data/homology_split.csv
+data/protein_level_split.csv
